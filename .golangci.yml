@@ -1,0 +1,67 @@
+version: "2"
+
+linters:
+  default: none
+
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - errorlint
+    - bodyclose
+    - contextcheck
+    - noctx
+    - sqlclosecheck
+    - wsl_v5
+
+  exclusions:
+    generated: strict
+
+  settings:
+    wsl_v5:
+      # Не требуем пустую строку после первого выражения: gofumpt её удаляет.
+      allow-first-in-block: true
+      allow-whole-block: true
+      branch-max-lines: 1
+      case-max-lines: 1
+      cuddle-max-statements: 0
+
+      default: none
+
+      enable:
+        - append
+        - decl
+        - defer
+        - expr
+        - for
+        - go
+        - inc-dec
+        - label
+        - range
+        - return
+        - select
+        - send
+        - switch
+        - type-switch
+
+        - after-block
+        - after-decl
+        - after-defer
+        - after-go
+
+        - leading-whitespace
+        - trailing-whitespace
+
+formatters:
+  enable:
+    - gofumpt
+
+  settings:
+    gofumpt:
+      extra:
+        group-params: true
+
+  exclusions:
+    generated: strict

@@ -1,0 +1,89 @@
+services:
+  db:
+    image: postgres:18-alpine
+    ports:
+      - "127.0.0.1:${DB_HOST_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: "${DB_USER:-postgres}"
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD is required, see .env.example}"
+      POSTGRES_DB: "${DB_NAME:-negotiation_simulator}"
+
+    volumes:
+      - db_data:/var/lib/postgresql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-negotiation_simulator}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: backend/api-service
+      additional_contexts:
+        - openapi=./api
+        - certs=./deploy/certs
+    environment:
+      HTTP_PORT: "${HTTP_PORT:-8090}"
+      HTTP_READ_HEADER_TIMEOUT: "${HTTP_READ_HEADER_TIMEOUT:-5s}"
+      HTTP_SHUTDOWN_TIMEOUT: "${HTTP_SHUTDOWN_TIMEOUT:-10s}"
+      HEALTHCHECK_TIMEOUT: "${HEALTHCHECK_TIMEOUT:-2s}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-}"
+      OPENAPI_SPEC_PATH: "${OPENAPI_SPEC_PATH:-/app/openapi.yaml}"
+      CONTENT_DIR: "${CONTENT_DIR:-/app/content}"
+      ENV: "${ENV:-dev}"
+      DB_HOST: "${DB_HOST:-db}"
+      DB_PORT: "${DB_PORT:-5432}"
+      DB_USER: "${DB_USER:-postgres}"
+      DB_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD is required, see .env.example}"
+      DB_NAME: "${DB_NAME:-negotiation_simulator}"
+      DB_SSLMODE: "${DB_SSLMODE:-disable}"
+      DB_MAX_OPEN_CONNS: "${DB_MAX_OPEN_CONNS:-25}"
+      DB_MAX_IDLE_CONNS: "${DB_MAX_IDLE_CONNS:-25}"
+      DB_CONN_MAX_LIFETIME: "${DB_CONN_MAX_LIFETIME:-5m}"
+      JWT_SECRET: "${JWT_SECRET:?JWT_SECRET is required, see .env.example}"
+      ACCESS_TOKEN_TTL: "${ACCESS_TOKEN_TTL:-15m}"
+      REFRESH_TOKEN_TTL: "${REFRESH_TOKEN_TTL:-720h}"
+      REFRESH_COOKIE_NAME: "${REFRESH_COOKIE_NAME:-refresh_token}"
+      REFRESH_COOKIE_INSECURE: "${REFRESH_COOKIE_INSECURE:-true}"
+      GIGACHAT_AUTH_KEY: "${GIGACHAT_AUTH_KEY:-}"
+      GIGACHAT_CLIENT_ID: "${GIGACHAT_CLIENT_ID:-}"
+      GIGACHAT_CLIENT_SECRET: "${GIGACHAT_CLIENT_SECRET:-}"
+      GIGACHAT_SCOPE: "${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}"
+      GIGACHAT_MODEL: "${GIGACHAT_MODEL:-}"
+      GIGACHAT_AUTH_URL: "${GIGACHAT_AUTH_URL:-https://ngw.devices.sberbank.ru:9443/api/v2/oauth}"
+      GIGACHAT_BASE_URL: "${GIGACHAT_BASE_URL:-https://gigachat.devices.sberbank.ru/api/v1}"
+      GIGACHAT_REQUEST_TIMEOUT: "${GIGACHAT_REQUEST_TIMEOUT:-30s}"
+      GIGACHAT_MAX_TOKENS: "${GIGACHAT_MAX_TOKENS:-1024}"
+      GIGACHAT_TEMPERATURE: "${GIGACHAT_TEMPERATURE:-0.7}"
+    ports:
+      - "127.0.0.1:8090:${HTTP_PORT:-8090}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:$$HTTP_PORT/health/live"]
+      interval: 10s
+      timeout: ${HEALTHCHECK_TIMEOUT:-2s}
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./frontend/public:/usr/share/nginx/html:ro
+      - ./frontend/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:3000:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  db_data:

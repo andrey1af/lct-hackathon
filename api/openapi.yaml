@@ -1,0 +1,1364 @@
+openapi: 3.0.3
+info:
+  title: Арена переговоров — API
+  description: >-
+    REST API сервиса «Арена переговоров» (ЛЦТ 2026 × ОЭЗ ППТ «Алабуга», команда 83).
+
+
+    Документ описывает то, что реально зарегистрировано в роутере
+    (`internal/transport/http/router.go`) и реализовано в обработчиках.
+
+
+    **Аутентификация.** JWT. Access-токен передаётся в заголовке
+    `Authorization: Bearer <token>` либо в HttpOnly cookie `access_token` —
+    сервер принимает оба варианта. Refresh-токен одноразовый и живёт в HttpOnly
+    cookie; при `POST /auth/refresh` он ротируется, старый становится
+    недействительным. Регистрация (`/auth/register`) и проверки здоровья
+    (`/health/*`) находятся в корне, все остальные пути — под `/api/v1`.
+
+
+    **Мультитенантность.** Все пути `/api/v1/companies/{cid}/...` проходят через
+    middleware, которое требует активного членства пользователя в компании `cid`.
+    Отсутствие токена — 401, чужая компания или неактивное членство — 404
+    (существование компании наружу не подтверждается), недостаточная роль внутри
+    своей компании — 403. `cid` из пути сам по себе доступа не даёт.
+
+
+    **Роли в компании:** `employee`, `company_admin`, `platform_admin`.
+    Первая компания и её администратор создаются один раз командой
+    `/app/bootstrap` (`make bootstrap`), через API компании не создаются.
+
+
+    **Ошибки.** Все ошибки возвращаются в едином виде
+    `{"error": {"code": "...", "message": "..."}}`. Коды перечислены в описании
+    каждого ответа.
+  version: 0.3.0
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+tags:
+  - name: Health
+    description: Служебные эндпоинты для проверки состояния сервиса (liveness/readiness).
+  - name: Auth
+    description: Регистрация, вход, ротация и отзыв токенов.
+  - name: Platform
+    description: Профиль пользователя, участники компании, приглашения и история сессий.
+  - name: Learning
+    description: Учебные модули, шаги и прогресс. Требуют активного членства в компании.
+  - name: Negotiation
+    description: Каталог кейсов и диалог с ИИ-оппонентом в контексте компании.
+
+paths:
+  # ------------------------------------------------------------------ Health
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: getHealthLive
+      summary: Liveness probe
+      description: >-
+        Показывает, что процесс HTTP-сервера запущен и способен обрабатывать
+        запросы. Внешние зависимости не проверяет — используется, чтобы решить,
+        нужно ли перезапускать контейнер.
+      security: []
+      responses:
+        "200":
+          description: Процесс сервиса жив.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LivenessResponse" }
+              example: { status: ok }
+
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: getHealthReady
+      summary: Readiness probe
+      description: >-
+        Показывает, готов ли сервис принимать трафик: общий статус и статус
+        каждой зависимости отдельно (`services`). БД проверяется ping-ом с
+        таймаутом `HEALTHCHECK_TIMEOUT`.
+      security: []
+      responses:
+        "200":
+          description: Сервис и все зависимости готовы принимать трафик.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadinessResponse" }
+              example: { status: ok, services: { database: ok } }
+        "503":
+          description: Как минимум одна зависимость недоступна или не ответила за таймаут.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadinessResponse" }
+              example: { status: unavailable, services: { database: unavailable } }
+
+  # -------------------------------------------------------------------- Auth
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerUser
+      summary: Регистрация нового пользователя
+      description: >-
+        Создаёт пользователя без компании: членство выдаётся только через
+        приглашение. До принятия приглашения ни один эндпоинт
+        `/api/v1/companies/{cid}/...` такому пользователю недоступен.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+            example:
+              email: user@example.com
+              password: supersecret123
+              name: Иван Иванов
+      responses:
+        "201":
+          description: Пользователь создан, access-токен в теле, оба токена в HttpOnly cookie.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JWTResponse" }
+        "400":
+          description: >-
+            Некорректное тело. Коды: `invalid request body`, `invalid email`,
+            `invalid input`, `password must be 8-72 bytes long`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Пользователь с таким email уже зарегистрирован. Код `email already registered`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: loginUser
+      summary: Вход по email и паролю
+      description: >-
+        Ограничение частоты: не более 10 попыток в минуту с одного IP, иначе 429
+        с заголовком `Retry-After`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Успешный вход.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JWTResponse" }
+        "400":
+          description: Некорректное тело. Коды `invalid request body`, `invalid email`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Неверный email или пароль. Код `invalid email or password`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshToken
+      summary: Обновление сессии по refresh-токену
+      description: >-
+        Refresh-токен берётся из HttpOnly cookie, а при её отсутствии — из тела
+        запроса. После обновления старый токен становится недействительным.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: Access-токен обновлён, cookies ротированы.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JWTResponse" }
+        "400":
+          description: Тело запроса не является корректным JSON. Код `invalid_request`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Refresh-токен отсутствует, некорректен, просрочен или уже использован.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logoutUser
+      summary: Завершение сессии (отзыв refresh-токена)
+      description: Требует access-токен; refresh-токен берётся из cookie либо из тела запроса.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LogoutRequest" }
+      responses:
+        "204":
+          description: Сессия завершена, refresh-токен отозван.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422":
+          description: Refresh-токен отсутствует или пуст. Код `invalid refresh token for logout`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ---------------------------------------------------------------- Platform
+  /api/v1/me:
+    get:
+      tags: [Platform]
+      operationId: getMe
+      summary: Профиль и активные компании пользователя
+      description: >-
+        В `companies` попадают только компании с активным членством. Пустой
+        список означает, что пользователь ещё не принял приглашение.
+      responses:
+        "200":
+          description: Профиль.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [Platform]
+      operationId: updateMe
+      summary: Изменить имя пользователя
+      description: Единственное изменяемое поле — `name`. Смены пароля и email в API нет.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProfileUpdateRequest" }
+            example: { name: Иван Иванов }
+      responses:
+        "200":
+          description: Обновлённый профиль.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/invitations/accept:
+    post:
+      tags: [Platform]
+      operationId: acceptInvitation
+      summary: Принять одноразовое приглашение
+      description: >-
+        Токен одноразовый и живёт 7 дней. Если пользователя с email приглашения
+        ещё нет, он создаётся из переданных `name` и `password`, и запрос должен
+        идти без access-токена. Если пользователь уже существует, он передаёт
+        свой access-токен, а `name` и `password` игнорируются; токен другого
+        пользователя даёт 401. Повторное принятие и просроченное приглашение
+        дают 409.
+      security:
+        - {}
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InvitationAcceptRequest" }
+            examples:
+              newUser:
+                value: { token: "0M9v1...", name: Пётр Петров, password: supersecret123 }
+              existingUser:
+                value: { token: "0M9v1..." }
+      responses:
+        "200":
+          description: Членство создано или обновлено, приглашение погашено.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "400":
+          description: >-
+            Пустой токен, либо новый пользователь без имени или с паролем вне
+            8–72 байт. Коды `invalid_request`, `invalid input`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: >-
+            Передан недействительный access-токен либо токен пользователя с
+            другим email. Код `unauthorized`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Приглашение уже принято или просрочено. Код `conflict`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/members:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+    get:
+      tags: [Platform]
+      operationId: listMembers
+      summary: Участники компании
+      description: Доступно только роли `company_admin` или `platform_admin`.
+      responses:
+        "200":
+          description: Участники, отсортированные по имени.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: "#/components/schemas/Member" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/members/{uid}:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/MemberID"
+    patch:
+      tags: [Platform]
+      operationId: updateMember
+      summary: Изменить роль или статус участника
+      description: >-
+        Доступно только администратору компании. Снять роль или деактивировать
+        последнего активного `company_admin` нельзя — такой запрос возвращает
+        409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MemberUpdateRequest" }
+            example: { role: company_admin, status: active }
+      responses:
+        "204":
+          description: Участник обновлён.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Попытка снять последнего активного администратора компании. Код `conflict`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/invitations:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+    post:
+      tags: [Platform]
+      operationId: createInvitation
+      summary: Создать одноразовое приглашение
+      description: >-
+        Доступно только администратору компании. В базе хранится только
+        SHA-256-хеш токена, поэтому открытый токен возвращается ровно один раз —
+        в этом ответе. Срок жизни — 7 дней. Ссылку на принятие формирует клиент.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InvitationCreateRequest" }
+            example: { email: new@example.com, role: employee }
+      responses:
+        "201":
+          description: Приглашение создано, токен возвращается один раз.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invitation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/me/sessions:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+    get:
+      tags: [Platform]
+      operationId: mySessions
+      summary: История сессий пользователя в компании
+      responses:
+        "200":
+          description: История от новых к старым.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/SessionHistory" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ---------------------------------------------------------------- Learning
+  /api/v1/companies/{cid}/modules:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+    get:
+      tags: [Learning]
+      operationId: listModules
+      summary: Дорожка обучения текущего пользователя
+      responses:
+        "200":
+          description: Статусы вычислены на сервере для пользователя и компании.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [modules]
+                properties:
+                  modules:
+                    type: array
+                    items: { $ref: "#/components/schemas/ModuleSummary" }
+              example:
+                modules:
+                  - id: 83000000-0000-4000-8000-000000000111
+                    version: 1
+                    title: Интересы и вопросы
+                    order: 1
+                    skill_ids: [SK-01, SK-03]
+                    status: available
+                    completed_steps: 0
+                    total_steps: 6
+                  - id: 83000000-0000-4000-8000-000000000112
+                    version: 1
+                    title: Условные уступки и BATNA
+                    order: 2
+                    skill_ids: [SK-02, SK-06]
+                    status: locked
+                    completed_steps: 0
+                    total_steps: 6
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/modules/{id}:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/ModuleVersionID"
+    get:
+      tags: [Learning]
+      operationId: getModule
+      summary: Модуль и публичные шаги
+      description: >-
+        Закрытый модуль и не самая свежая версия возвращают 404. Ответ не
+        содержит `answer_key`, `private_config` и рубрику.
+      responses:
+        "200":
+          description: Состояние шагов восстанавливается из сохранённых попыток.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModuleDetail" }
+              example:
+                id: 83000000-0000-4000-8000-000000000111
+                version: 1
+                title: Интересы и вопросы
+                order: 1
+                skill_ids: [SK-01, SK-03]
+                status: in_progress
+                completed_steps: 1
+                total_steps: 6
+                steps:
+                  - id: 83000000-0000-4000-8000-000000000121
+                    order: 1
+                    type: theory
+                    content: Краткая теория о различии позиции и интереса.
+                    options: []
+                    completed: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/steps/{id}/attempts:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/StepID"
+    post:
+      tags: [Learning]
+      operationId: submitStepAttempt
+      summary: Проверить и сохранить попытку шага
+      description: >-
+        Для шага `theory` передаётся `answer: confirmed`, для `choice` — ID
+        варианта. `client_attempt_id` обеспечивает идемпотентность: повтор того
+        же ключа с тем же ответом возвращает сохранённый результат, повтор с
+        другим ответом — 409. Тело должно содержать ровно один JSON-объект без
+        неизвестных полей.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StepAttemptRequest" }
+            example: { client_attempt_id: "4b55fa99-1f80-4c3e-98cc-96ed78081a13", answer: b }
+      responses:
+        "200":
+          description: Проверка выполнена сервером, попытка сохранена.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StepAttemptResult" }
+              examples:
+                incorrect:
+                  value: { correct: false, completed: false, explanation: "Вопрос выясняет причину срока.", module_status: in_progress, completed_steps: 1, total_steps: 6 }
+                correct:
+                  value: { correct: true, completed: true, explanation: "Вопрос выясняет причину срока.", module_status: in_progress, completed_steps: 2, total_steps: 6 }
+        "400":
+          description: >-
+            Некорректное тело или ответ. Коды `invalid_request`,
+            `invalid_answer`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Шаг закрыт или `client_attempt_id` повторён с другим ответом. Код `conflict`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/me/progress:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+    get:
+      tags: [Learning]
+      operationId: myProgress
+      summary: Статусы модулей пользователя
+      description: Тот же список, что и `GET /modules`, без шагов.
+      responses:
+        "200":
+          description: Прогресс.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [modules]
+                properties:
+                  modules:
+                    type: array
+                    items: { $ref: "#/components/schemas/ModuleSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/team/progress:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+    get:
+      tags: [Learning]
+      operationId: teamProgress
+      summary: Прогресс сотрудников компании
+      description: Доступно только роли `company_admin` или `platform_admin`.
+      responses:
+        "200":
+          description: Прогресс команды.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: "#/components/schemas/TeamMemberProgress" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/modules/{id}/assessment-sessions:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/ModuleVersionID"
+    post:
+      tags: [Learning]
+      operationId: startModuleAssessment
+      summary: Начать проверочный кейс модуля
+      description: >-
+        Единственный способ создать сессию режима `assessment`. Доступен после
+        прохождения всех шагов модуля: до этого возвращается 409
+        `assessment_locked`. Подсказки в такой сессии отключены.
+      responses:
+        "201":
+          description: Проверочная сессия создана, диалог открыт репликой оппонента.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NegotiationSession" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: >-
+            Теория модуля не пройдена (`assessment_locked`) либо предыдущая
+            попытка ещё активна (`invalid_session_state`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ------------------------------------------------------------- Negotiation
+  /api/v1/companies/{cid}/cases:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+    get:
+      tags: [Negotiation]
+      operationId: listNegotiationCases
+      summary: Каталог опубликованных кейсов
+      description: >-
+        Возвращает по одной, самой свежей версии каждого кейса. Закрытые данные
+        сценария (`private_config`) и рубрика оценки наружу не отдаются.
+      responses:
+        "200":
+          description: Список кейсов.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cases]
+                properties:
+                  cases:
+                    type: array
+                    items: { $ref: "#/components/schemas/NegotiationCase" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/cases/{id}:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/CaseKey"
+    get:
+      tags: [Negotiation]
+      operationId: getNegotiationCase
+      summary: Публичная карточка кейса
+      responses:
+        "200":
+          description: Карточка без `private_config` и рубрики.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NegotiationCase" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/sessions:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+    post:
+      tags: [Negotiation]
+      operationId: startNegotiationSession
+      summary: Начать практический диалог
+      description: >-
+        Создаёт сессию по выбранному кейсу и сразу запрашивает у оппонента первую
+        реплику, поэтому ответ уже содержит открывающее сообщение. Тело
+        необязательно: без `case_key` берётся кейс по умолчанию из конфигурации
+        сервиса. Запускается только режим `practice`; кейс режима `assessment`
+        через этот эндпоинт даёт 400.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NegotiationStartRequest" }
+            example: { case_key: practice-procurement }
+      responses:
+        "201":
+          description: Сессия создана, диалог открыт репликой оппонента.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NegotiationSession" }
+        "400":
+          description: >-
+            Некорректный JSON или попытка запустить проверочный кейс как
+            самостоятельный диалог. Код `invalid_request`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Коды `assessment_locked`, `invalid_session_state`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/sessions/{id}:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      tags: [Negotiation]
+      operationId: getNegotiationSession
+      summary: Получить сессию с историей диалога
+      responses:
+        "200":
+          description: Сессия и полная история реплик.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NegotiationSession" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/sessions/{id}/messages:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      tags: [Negotiation]
+      operationId: sendNegotiationMessage
+      summary: Отправить реплику и получить ответ оппонента
+      description: >-
+        `client_message_id` обязателен для идемпотентности: при повторной
+        отправке того же идентификатора возвращается уже вычисленный ход без
+        нового вызова модели. Неизвестные поля в теле запрещены.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NegotiationMessageRequest" }
+            example: { client_message_id: "4b55fa99-1f80-4c3e-98cc-96ed78081a13", text: "Какой объём вы готовы поставить к 14-му дню?" }
+      responses:
+        "200":
+          description: Ход обработан, получен ответ оппонента.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NegotiationTurn" }
+        "400":
+          description: Пустой текст, отсутствующий `client_message_id` или некорректный JSON. Код `invalid_request`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Сессия не активна или исчерпан лимит ходов. Код `invalid_session_state`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/sessions/{id}/hint:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      tags: [Negotiation]
+      operationId: requestNegotiationHint
+      summary: Подсказка тренера
+      description: >-
+        Возвращает одну подсказку о действии, которого не хватает в репликах
+        игрока. Доступна только в активной сессии режима `practice` и не более
+        трёх раз за сессию. Подсказка не попадает в историю диалога и не
+        участвует в оценке. Если модель недоступна, возвращается статическая
+        подсказка, и попытка не расходуется.
+      responses:
+        "200":
+          description: Подсказка получена.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NegotiationHint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Подсказки отключены в кейсе режима `assessment`. Код `hints_disabled`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Сессия не активна или исчерпан лимит подсказок. Код `hint_unavailable`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/sessions/{id}/retry:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      tags: [Negotiation]
+      operationId: retryNegotiationSession
+      summary: Пройти тот же кейс заново
+      description: >-
+        Создаёт новую сессию по тому же кейсу и модулю с пустой историей.
+        Предыдущая попытка остаётся доступной для чтения. Активную сессию
+        сначала нужно завершить, иначе 409.
+      responses:
+        "201":
+          description: Новая попытка создана, диалог открыт репликой оппонента.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NegotiationSession" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Текущая попытка ещё активна. Код `invalid_session_state`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/sessions/{id}/finish:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      tags: [Negotiation]
+      operationId: finishNegotiationSession
+      summary: Завершить диалог и получить результат
+      description: >-
+        Закрывает активную сессию и возвращает разбор по рубрике, не дожидаясь
+        исчерпания `max_turns`. Повторный вызов на уже завершённой сессии
+        возвращает тот же результат без повторного вызова модели.
+      responses:
+        "200":
+          description: Сессия завершена, результат посчитан.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NegotiationResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Сессию параллельно меняет другой запрос. Код `session_not_evaluated`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/companies/{cid}/sessions/{id}/feedback:
+    parameters:
+      - $ref: "#/components/parameters/CompanyID"
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      tags: [Negotiation]
+      operationId: getNegotiationResult
+      summary: Разбор завершённой сессии
+      description: >-
+        Разбор считается при первом обращении и сохраняется, поэтому повторные
+        вызовы читают тот же результат. Для активной сессии возвращается 409.
+      responses:
+        "200":
+          description: Разбор сессии по критериям рубрики.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NegotiationResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Сессия ещё активна. Код `session_not_evaluated`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        Access-токен. Сервер принимает его также из HttpOnly cookie
+        `access_token`, поэтому запрос из браузера может идти без заголовка.
+
+  parameters:
+    CompanyID:
+      name: cid
+      in: path
+      required: true
+      description: ID компании, в которой у пользователя есть активное членство.
+      schema: { type: string, format: uuid }
+    MemberID:
+      name: uid
+      in: path
+      required: true
+      description: ID пользователя внутри компании.
+      schema: { type: string, format: uuid }
+    ModuleVersionID:
+      name: id
+      in: path
+      required: true
+      description: ID версии модуля. Не самая свежая версия возвращает 404.
+      schema: { type: string, format: uuid }
+    StepID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SessionID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CaseKey:
+      name: id
+      in: path
+      required: true
+      description: Публичный ключ кейса (`case_key`), а не UUID.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Некорректное тело запроса. Код `invalid_request`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: >-
+        Access-токен отсутствует или недействителен. Коды `unauthorized`,
+        `missing or invalid authorization header`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: У пользователя нет подходящей активной роли в компании. Код `forbidden`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: >-
+        Объекта нет или он недоступен в этой компании. Тот же ответ возвращается
+        для чужой компании и неактивного членства. Код `not_found`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooManyRequests:
+      description: >-
+        Превышен лимит попыток входа (10 в минуту с одного IP). Код
+        `rate_limited`, в заголовке `Retry-After` — пауза в секундах.
+      headers:
+        Retry-After:
+          description: Через сколько секунд можно повторить.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InternalError:
+      description: Внутренняя ошибка. Коды `internal_error`, `internal error`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, description: Машиночитаемый код ошибки }
+            message: { type: string, description: Человекочитаемое пояснение }
+
+    LivenessResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+
+    ReadinessResponse:
+      type: object
+      additionalProperties: false
+      required: [status, services]
+      properties:
+        status:
+          type: string
+          description: "Итоговый статус: `unavailable`, если хотя бы один сервис из `services` не готов."
+          enum: [ok, unavailable]
+        services:
+          type: object
+          description: Статус готовности по каждой зависимости отдельно.
+          additionalProperties:
+            type: string
+            enum: [ok, unavailable]
+          example: { database: ok }
+
+    RegisterRequest:
+      type: object
+      required: [email, password, name]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, minLength: 8, maxLength: 72, description: Длина проверяется в байтах }
+        name: { type: string, minLength: 1, maxLength: 100 }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, minLength: 1 }
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          description: Нужен, только если refresh-токена нет в cookie.
+
+    LogoutRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          description: Нужен, только если refresh-токена нет в cookie.
+
+    JWTResponse:
+      type: object
+      required: [accessToken]
+      properties:
+        accessToken:
+          type: string
+          description: JWT access-токен. Refresh-токен выдаётся только в HttpOnly cookie.
+
+    Role:
+      type: string
+      enum: [employee, company_admin, platform_admin]
+
+    MembershipStatus:
+      type: string
+      enum: [active, inactive]
+
+    Profile:
+      type: object
+      required: [id, email, name, companies]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+        companies:
+          type: array
+          description: Только компании с активным членством.
+          items:
+            type: object
+            required: [id, name, role]
+            properties:
+              id: { type: string, format: uuid }
+              name: { type: string }
+              role: { $ref: "#/components/schemas/Role" }
+
+    ProfileUpdateRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+
+    Member:
+      type: object
+      required: [user_id, email, name, role, status]
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        status: { $ref: "#/components/schemas/MembershipStatus" }
+
+    MemberUpdateRequest:
+      type: object
+      required: [role, status]
+      properties:
+        role: { type: string, enum: [employee, company_admin] }
+        status: { $ref: "#/components/schemas/MembershipStatus" }
+
+    InvitationCreateRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email: { type: string, format: email }
+        role: { type: string, enum: [employee, company_admin] }
+
+    Invitation:
+      type: object
+      required: [token, email, role, expires_at]
+      properties:
+        token:
+          type: string
+          description: >-
+            Одноразовый токен из 32 случайных байт в base64url. В базе хранится
+            только его хеш, поэтому получить токен повторно нельзя.
+        email: { type: string, format: email }
+        role: { type: string, enum: [employee, company_admin] }
+        expires_at: { type: string, format: date-time, description: Через 7 дней после создания }
+
+    InvitationAcceptRequest:
+      type: object
+      required: [token]
+      properties:
+        token: { type: string, minLength: 1 }
+        name:
+          type: string
+          description: Только для нового пользователя.
+        password:
+          type: string
+          minLength: 8
+          maxLength: 72
+          description: Только для нового пользователя.
+
+    SessionHistory:
+      type: object
+      required: [id, title, mode, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string, description: Название кейса }
+        mode: { type: string, enum: [practice, assessment] }
+        status: { type: string, enum: [active, finished, evaluated] }
+        created_at: { type: string, format: date-time }
+
+    LearningStatus:
+      type: string
+      enum: [locked, available, in_progress, assessment_ready, needs_retry, passed]
+
+    ModuleSummary:
+      type: object
+      required: [id, version, title, order, skill_ids, status, completed_steps, total_steps]
+      properties:
+        id: { type: string, format: uuid, description: ID версии модуля }
+        version: { type: integer, minimum: 1 }
+        title: { type: string }
+        order: { type: integer, minimum: 1 }
+        skill_ids: { type: array, items: { type: string } }
+        status: { $ref: "#/components/schemas/LearningStatus" }
+        completed_steps: { type: integer, minimum: 0 }
+        total_steps: { type: integer, minimum: 1 }
+
+    Step:
+      type: object
+      required: [id, order, type, content, options, completed]
+      properties:
+        id: { type: string, format: uuid }
+        order: { type: integer, minimum: 1 }
+        type: { type: string, enum: [theory, choice] }
+        content: { type: string }
+        options:
+          type: array
+          description: Для шага `theory` пустой массив.
+          items:
+            type: object
+            required: [id, text]
+            properties:
+              id: { type: string }
+              text: { type: string }
+        completed: { type: boolean }
+
+    ModuleDetail:
+      allOf:
+        - $ref: "#/components/schemas/ModuleSummary"
+        - type: object
+          required: [steps]
+          properties:
+            steps: { type: array, items: { $ref: "#/components/schemas/Step" } }
+
+    StepAttemptRequest:
+      type: object
+      additionalProperties: false
+      required: [client_attempt_id, answer]
+      properties:
+        client_attempt_id: { type: string, minLength: 1, maxLength: 128 }
+        answer: { type: string, minLength: 1, description: "`confirmed` для theory, ID варианта для choice" }
+
+    StepAttemptResult:
+      type: object
+      required: [correct, completed, explanation, module_status, completed_steps, total_steps]
+      properties:
+        correct: { type: boolean }
+        completed: { type: boolean, description: Шаг закрыт и больше не требует ответа }
+        explanation: { type: string }
+        module_status: { $ref: "#/components/schemas/LearningStatus" }
+        completed_steps: { type: integer, minimum: 0 }
+        total_steps: { type: integer, minimum: 1 }
+
+    TeamMemberProgress:
+      type: object
+      required: [user_id, email, name, role, modules]
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        modules:
+          type: array
+          items: { $ref: "#/components/schemas/ModuleSummary" }
+
+    NegotiationCase:
+      type: object
+      required: [key, title, mode, difficulty, skill_ids, max_turns, briefing, hints_available, locked]
+      properties:
+        key: { type: string, description: "Ключ кейса, передаётся при создании сессии" }
+        title: { type: string }
+        mode: { type: string, enum: [practice, assessment] }
+        difficulty: { type: string, enum: [easy, medium, hard] }
+        skill_ids: { type: array, items: { type: string } }
+        max_turns: { type: integer, minimum: 1 }
+        briefing: { type: string, description: Задание игрока; закрытые данные сценария сюда не попадают }
+        hints_available: { type: boolean, description: Подсказки доступны только в practice }
+        locked:
+          type: boolean
+          description: >-
+            Кейс режима assessment закрыт, пока не пройдена теория модуля.
+            Попытка открыть его возвращает 409 `assessment_locked`.
+        unlocked_by: { type: string, description: "Название модуля, который открывает этот кейс" }
+
+    NegotiationStartRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        case_key:
+          type: string
+          description: Ключ кейса из каталога. Пустое значение — кейс по умолчанию из конфигурации сервиса.
+
+    NegotiationMessage:
+      type: object
+      required: [role, turn_number, text, created_at]
+      properties:
+        role: { type: string, enum: [user, opponent] }
+        turn_number: { type: integer, minimum: 1 }
+        text: { type: string }
+        created_at: { type: string, format: date-time }
+
+    NegotiationSession:
+      type: object
+      required: [session_id, status, mode, case_key, title, briefing, attempt, turns_used, max_turns, hints_used, hints_left, messages]
+      properties:
+        session_id: { type: string, format: uuid }
+        status: { type: string, enum: [active, finished, evaluated] }
+        mode: { type: string, enum: [practice, assessment] }
+        case_key: { type: string }
+        title: { type: string }
+        briefing: { type: string }
+        attempt: { type: integer, minimum: 1, description: Номер попытки по этому кейсу }
+        turns_used: { type: integer, minimum: 0 }
+        max_turns: { type: integer, minimum: 1 }
+        hints_used: { type: integer, minimum: 0 }
+        hints_left: { type: integer, minimum: 0, description: В режиме assessment всегда 0 }
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/NegotiationMessage" }
+
+    NegotiationMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [client_message_id, text]
+      properties:
+        client_message_id: { type: string, minLength: 1, description: Ключ идемпотентности хода }
+        text: { type: string, minLength: 1 }
+
+    NegotiationTurn:
+      type: object
+      required: [session_id, status, turn_number, player_message, opponent_message, turns_used, max_turns]
+      properties:
+        session_id: { type: string, format: uuid }
+        status: { type: string, enum: [active, finished, evaluated] }
+        turn_number: { type: integer, minimum: 1 }
+        player_message: { $ref: "#/components/schemas/NegotiationMessage" }
+        opponent_message: { $ref: "#/components/schemas/NegotiationMessage" }
+        turns_used: { type: integer, minimum: 0 }
+        max_turns: { type: integer, minimum: 1 }
+
+    NegotiationHint:
+      type: object
+      required: [session_id, hint, hints_used, hints_left]
+      properties:
+        session_id: { type: string, format: uuid }
+        hint: { type: string, description: "Одна подсказка о недостающем действии, без готовой фразы" }
+        hints_used: { type: integer, minimum: 0 }
+        hints_left: { type: integer, minimum: 0 }
+
+    NegotiationCriterion:
+      type: object
+      required: [id, behavior, required, met, evidence, comment]
+      properties:
+        id: { type: string }
+        behavior: { type: string, description: Формулировка критерия из рубрики }
+        required: { type: boolean }
+        met: { type: boolean }
+        evidence:
+          type: string
+          description: >-
+            Цитата из реплики игрока. Сервис сверяет её со стенограммой: если
+            цитаты в репликах игрока нет, критерий не засчитывается, а поле
+            остаётся пустым.
+        comment: { type: string, description: "Комментарий о наблюдаемом действии, без оценки личности" }
+
+    NegotiationFeedback:
+      type: object
+      required: [what_worked, what_to_try_next]
+      properties:
+        what_worked: { type: string }
+        what_to_try_next: { type: string }
+
+    NegotiationResult:
+      type: object
+      required: [session_id, status, mode, case_key, title, passed, evaluation_status, rubric_version, criteria, feedback, attempt, turns_used, max_turns, can_retry]
+      properties:
+        session_id: { type: string, format: uuid }
+        status: { type: string, enum: [active, finished, evaluated] }
+        mode: { type: string, enum: [practice, assessment] }
+        case_key: { type: string }
+        title: { type: string }
+        passed: { type: boolean, description: Все обязательные критерии выполнены }
+        evaluation_status:
+          type: string
+          enum: [pending, evaluated, needs_retry]
+          description: >-
+            `evaluated` — разбор получен; `needs_retry` — модель не ответила или
+            вернула невалидный JSON, критерии отданы неподтверждёнными и попытку
+            нужно повторить. Общий балл не выставляется никогда (RULE-011).
+        rubric_version: { type: integer, minimum: 1 }
+        module_status:
+          allOf:
+            - $ref: "#/components/schemas/LearningStatus"
+          description: Присутствует только для сессий режима assessment.
+        criteria:
+          type: array
+          items: { $ref: "#/components/schemas/NegotiationCriterion" }
+        feedback: { $ref: "#/components/schemas/NegotiationFeedback" }
+        attempt: { type: integer, minimum: 1 }
+        turns_used: { type: integer, minimum: 0 }
+        max_turns: { type: integer, minimum: 1 }
+        can_retry:
+          type: boolean
+          description: Разбор получен, но рубрика не пройдена — есть смысл начать новую попытку.

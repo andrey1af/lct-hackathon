@@ -1,0 +1,5 @@
+{"case_key":"practice-procurement","version":1,"criteria":[
+ {"id":"partial_delivery_question","required":true,"behavior":"Выясняет возможность ускорить первую партию","success_example":"Сможете поставить 2 000 коробок к 14-му дню?","failure_example":"Спорит только о цене","evidence":"ID реплики пользователя с вопросом о партии"},
+ {"id":"measurable_trade","required":true,"behavior":"Предлагает измеримый обмен цены, объёма или графика оплаты","success_example":"Если закрепим объём 10 000, сможете снизить цену до 118 ₽?","failure_example":"Соглашается на предоплату 60% без выгоды","evidence":"ID реплики пользователя с условием"},
+ {"id":"alternative_check","required":true,"behavior":"Сравнивает итоговый пакет с альтернативой","success_example":"Итоговая цена и график должны оправдывать разницу с 118 ₽ и 25 днями","failure_example":"Принимает пакет хуже альтернативы без объяснения","evidence":"ID реплики пользователя с сравнением или отказом"}
+]}

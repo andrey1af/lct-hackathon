@@ -1,0 +1,94 @@
+@startuml architecture
+!theme plain
+
+skinparam shadowing false
+skinparam linetype ortho
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 13
+skinparam ArrowColor #44546A
+skinparam nodesep 25
+skinparam ranksep 65
+skinparam rectangle {
+  BackgroundColor #FFFFFF
+  BorderColor #44546A
+  RoundCorner 8
+}
+skinparam node {
+  BackgroundColor #F5F7FA
+  BorderColor #44546A
+}
+skinparam database {
+  BackgroundColor #FFFFFF
+  BorderColor #44546A
+}
+skinparam cloud {
+  BackgroundColor #FFFFFF
+  BorderColor #B0B7C3
+}
+skinparam note {
+  BackgroundColor #FFFDF0
+  BorderColor #C8B88A
+}
+
+title Симулятор переговоров — архитектура развёртывания
+
+actor "Сотрудник\nАдминистратор" as user
+
+node "Браузер" as browser {
+  rectangle "**SPA без сборки**\n<size:11>frontend/public: index.html, app.js, arena-api.js\nсостояние экрана и client_attempt_id — в localStorage,\nданные — только из API" as spa
+}
+
+cloud "**nginx с TLS**\n<size:11>Let's Encrypt, стоит перед стеком на сервере" as edge
+
+node "Контейнер frontend" as frontendBox {
+  rectangle "**nginx**\n<size:11>отдаёт статику, проксирует /api, /auth, /health,\n/openapi.yaml, /swagger в api" as nginx
+}
+
+node "Контейнер api — Go 1.27, net/http" as apiBox {
+  rectangle "**middleware**\n<size:11>request-id и лог → CORS → access-токен → членство" as mw
+
+  rectangle "**negotiation**\n<size:11>сессии, реплики,\nподсказки, оценка" as negotiation
+  rectangle "**services/learning**\n<size:11>модули, шаги, прогресс\nсвой и команды" as learning
+  rectangle "**services/auth**\n<size:11>регистрация, вход,\nприглашения, роли" as auth
+  rectangle "**content**\n<size:11>загрузка и проверка\nмодулей, кейсов, рубрик" as content
+
+  rectangle "**llm.Provider**\n<size:11>chain{ GigaChat → Mock }\nсценарии Mock через go:embed" as llm
+  rectangle "**repository · database · model**\n<size:11>GORM + pgx, SQL-миграции и seed при старте" as data
+}
+
+database "**PostgreSQL 18**\n<size:11>users · companies · memberships · invitations\ncases · case_versions · modules · module_versions · steps\nsessions · messages · assessments · learning_attempts" as pg
+
+cloud "gigachat.devices.sberbank.ru" as gigachat
+
+user --> spa
+spa --> edge : JSON поверх HTTPS,\nтот же origin
+edge --> nginx
+nginx --> mw : /api, /auth, /health
+
+mw --> negotiation
+mw --> learning
+mw --> auth
+
+negotiation --> llm : промпт: скрытая\nконфигурация кейса\n+ 12 последних реплик
+
+negotiation --> data
+learning --> data
+auth --> data
+content --> data
+data --> pg
+
+llm ..> gigachat : HTTPS, таймаут 45 с на ход,\n90 с на оценку
+
+note left of llm
+  Ошибка или таймаут GigaChat логируется,
+  ответ отдаёт Mock — сессия не обрывается
+  и демонстрация не зависит от внешнего API
+end note
+
+note right of data
+  Скрытая конфигурация кейса
+  клиенту не отдаётся: уходит
+  только в системный промпт
+end note
+
+@enduml

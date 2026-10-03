@@ -1,0 +1,7 @@
+{
+  "id":"83000000-0000-4000-8000-000000000202", "version_id":"83000000-0000-4000-8000-000000000212",
+  "key":"assessment-concessions", "version":1, "mode":"assessment", "title":"Продление контракта с поставщиком",
+  "difficulty":"medium", "skill_ids":["SK-02","SK-06"], "max_turns":8,
+  "briefing":"Вы закупаете 100 единиц оборудования. Текущий поставщик просит 1,18 млн ₽ и хочет аванс 70%. Доступная альтернатива: 1,10 млн ₽ с авансом 30% при одинаковом сроке и качестве. Обсудите взаимные уступки и решите, стоит ли заключать сделку. Подсказки в проверке недоступны.",
+  "private_config":{"opponent_role":"Директор по продажам поставщика","hidden_interest":"Поставщику важна предсказуемость объёма следующего квартала","issues":{"quantity":{"value":100,"unit":"единица"},"opening_price":{"value":1180000,"unit":"RUB"},"opening_advance":{"value":70,"unit":"percent"},"target_price":{"value":1080000,"unit":"RUB"},"target_advance":{"value":30,"unit":"percent"}},"player_batna":{"price":1100000,"advance_percent":30,"quality":"equal","delivery_days":14},"success_conditions":["предложить уступку только за встречный объём или условие","сравнить итог с BATNA","принять только предложение не хуже BATNA либо отказаться"],"failure_conditions":["безусловно принять 1,18 млн ₽","согласиться на пакет хуже BATNA"]}
+}

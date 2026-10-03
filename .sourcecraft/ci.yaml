@@ -1,0 +1,85 @@
+on:
+  pull_request:
+    - workflows: [ci]
+      filter:
+        source_branches: ["**"]
+        target_branches: ["main"]
+        paths:
+          - "backend/api-service/**"
+          - "backend/testdata/**"
+          - "api/**"
+          - ".golangci.yml"
+          - ".sourcecraft/ci.yaml"
+
+  push:
+    - workflows: [ci]
+      filter:
+        branches: ["main"]
+        paths:
+          - "backend/api-service/**"
+          - "backend/testdata/**"
+          - "api/**"
+          - ".golangci.yml"
+          - ".sourcecraft/ci.yaml"
+
+    - workflows: [cd]
+      filter:
+        branches: ["main"]
+        paths:
+          - "backend/api-service/**"
+          - "api/**"
+          - "frontend/**"
+          - "compose.yaml"
+          - "deploy/**"
+          - ".sourcecraft/ci.yaml"
+
+workflows:
+  ci:
+    tasks:
+      - name: build-test
+        cubes:
+          - name: go
+            image: golang:1.27.1
+            script:
+              - cd $SOURCECRAFT_WORKSPACE/backend/api-service && go build ./...
+              - cd $SOURCECRAFT_WORKSPACE/backend/api-service && go vet ./...
+              - cd $SOURCECRAFT_WORKSPACE/backend/api-service && go test ./... -race -cover
+
+      - name: lint
+        cubes:
+          - name: golangci-lint
+            image: golangci/golangci-lint:v2.13.2
+            script:
+              - cd $SOURCECRAFT_WORKSPACE/backend/api-service && golangci-lint run --config $SOURCECRAFT_WORKSPACE/.golangci.yml
+
+      - name: postgres-integration
+        cubes:
+          - name: go-postgres
+            image: golang:1.27.1-alpine
+            script:
+              - apk add --no-cache postgresql18 postgresql18-client build-base
+              - mkdir -p /tmp/pgdata /run/postgresql && chown postgres:postgres /tmp/pgdata /run/postgresql
+              - su postgres -s /bin/sh -c 'initdb -D /tmp/pgdata -A trust --no-instructions'
+              - su postgres -s /bin/sh -c "pg_ctl -D /tmp/pgdata -o '-h 127.0.0.1' -w start"
+              - su postgres -s /bin/sh -c 'createdb integration'
+              - cd $SOURCECRAFT_WORKSPACE/backend/api-service && BE3_TEST_DSN='postgres://postgres@127.0.0.1:5432/integration?sslmode=disable' go test ./... -race -count=1
+
+  cd:
+    tasks:
+      - name: deploy-dev
+        cubes:
+          - name: ssh-deploy
+            image: alpine:3.20
+            env:
+              SSH_HOST: ${{ secrets.DEV_SSH_HOST }}
+              SSH_USER: ${{ secrets.DEV_SSH_USER }}
+              SSH_KEY: ${{ secrets.DEV_SSH_PRIVATE_KEY }}
+              DEPLOY_PATH: ${{ secrets.DEV_DEPLOY_PATH }}
+            script:
+              - apk add --no-cache openssh-client
+              - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+              - printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+              - chmod 600 ~/.ssh/id_ed25519
+              - |
+                ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" \
+                  "cd $DEPLOY_PATH && git fetch origin main && git reset --hard origin/main && make prod"

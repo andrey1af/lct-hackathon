@@ -1,0 +1,6 @@
+.env
+backend/api-service/bin/
+ignore/
+../.idea/
+deploy/certbot/conf/
+deploy/certbot/www/
